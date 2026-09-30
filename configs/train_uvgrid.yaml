@@ -1,0 +1,7 @@
+# Experimental UV-grid support.
+base: train.yaml
+model:
+  geom_repr: uvgrid
+  geom_vae_surf_ckpt: weights/abc_vae_surf.pt
+  geom_vae_edge_ckpt: weights/abc_vae_edge.pt
+  geom_vae_z_scale: 1.0

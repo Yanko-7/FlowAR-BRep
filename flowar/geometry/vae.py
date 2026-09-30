@@ -1,0 +1,1200 @@
+# Third-party VAE components adapted from BrepGen:
+# https://github.com/samxuxiang/BrepGen/blob/main/network.py
+# Upstream terms: https://github.com/samxuxiang/BrepGen/blob/main/LICENSE
+# Upstream GPL text: https://github.com/samxuxiang/BrepGen/blob/main/LICENSE_GPL
+# BrepGen prohibits commercial usage and specifies GPL v3 for research purposes.
+# Both upstream license texts, including the warranty disclaimer, are reproduced
+# in the comment appendix at the end of this file. The noncommercial restriction
+# is part of BrepGen's terms; this is not an unqualified GPL-only license notice.
+# FlowAR modifications (2026-09-30): extract the required VAE components and add
+# the GeomVAE wrapper, checkpoint loading, and shape validation.
+
+"""VAE wrapper for the optional UV-grid geometry representation.
+
+This module vendors the minimal set of BrepGen VAE encoder/decoder classes
+(from ``BrepGen/network.py``) needed to compress/decompress surface UV grids and
+edge point sequences, plus a small :class:`GeomVAE` wrapper that loads the
+pretrained ``abc_vae_surf.pt`` / ``abc_vae_edge.pt`` checkpoints and exposes
+convenient encode/decode entry points used by the trainer and the BRep builder.
+
+Latent shapes (pretrained checkpoints, latent_channels=3):
+    surface : grid [B, 32, 32, 3] <-> latent [B, 3, 4, 4] -> flat 48
+    edge    : grid [B, 32, 3]     <-> latent [B, 3, 4]     -> flat 12
+
+The classes below are copied (not imported) from BrepGen to keep this file
+self-contained and independent of the untracked sibling ``BrepGen/`` directory.
+"""
+
+import math
+from typing import Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.autoencoders.vae import (
+    Decoder,
+    DiagonalGaussianDistribution,
+    Encoder,
+)
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.unets.unet_1d_blocks import (
+    ResConvBlock,
+    SelfAttention1d,
+    Upsample1d,
+)
+
+# ============================================================================
+# 1D building blocks (vendored from BrepGen/network.py)
+# ============================================================================
+
+
+class UpBlock1D(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        mid_channels = in_channels if mid_channels is None else mid_channels
+        resnets = [
+            ResConvBlock(in_channels, mid_channels, mid_channels),
+            ResConvBlock(mid_channels, mid_channels, mid_channels),
+            ResConvBlock(mid_channels, mid_channels, out_channels),
+        ]
+        self.resnets = nn.ModuleList(resnets)
+        self.up = Upsample1d(kernel="cubic")
+
+    def forward(self, hidden_states, temb=None):
+        for resnet in self.resnets:
+            hidden_states = resnet(hidden_states)
+        hidden_states = self.up(hidden_states)
+        return hidden_states
+
+
+class UNetMidBlock1D(nn.Module):
+    def __init__(self, mid_channels: int, in_channels: int, out_channels: Optional[int] = None):
+        super().__init__()
+        out_channels = in_channels if out_channels is None else out_channels
+        resnets = [
+            ResConvBlock(in_channels, mid_channels, mid_channels),
+            ResConvBlock(mid_channels, mid_channels, mid_channels),
+            ResConvBlock(mid_channels, mid_channels, mid_channels),
+            ResConvBlock(mid_channels, mid_channels, mid_channels),
+            ResConvBlock(mid_channels, mid_channels, mid_channels),
+            ResConvBlock(mid_channels, mid_channels, out_channels),
+        ]
+        attentions = [
+            SelfAttention1d(mid_channels, mid_channels // 32),
+            SelfAttention1d(mid_channels, mid_channels // 32),
+            SelfAttention1d(mid_channels, mid_channels // 32),
+            SelfAttention1d(mid_channels, mid_channels // 32),
+            SelfAttention1d(mid_channels, mid_channels // 32),
+            SelfAttention1d(out_channels, out_channels // 32),
+        ]
+        self.attentions = nn.ModuleList(attentions)
+        self.resnets = nn.ModuleList(resnets)
+
+    def forward(
+        self, hidden_states: torch.FloatTensor, temb: Optional[torch.FloatTensor] = None
+    ) -> torch.FloatTensor:
+        for attn, resnet in zip(self.attentions, self.resnets):
+            hidden_states = resnet(hidden_states)
+            hidden_states = attn(hidden_states)
+        return hidden_states
+
+
+class Encoder1D(nn.Module):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=3,
+        down_block_types=("DownEncoderBlock1D",),
+        block_out_channels=(64,),
+        layers_per_block=2,
+        norm_num_groups=32,
+        act_fn="silu",
+        double_z=True,
+    ):
+        super().__init__()
+        self.layers_per_block = layers_per_block
+        self.conv_in = torch.nn.Conv1d(
+            in_channels, block_out_channels[0], kernel_size=3, stride=1, padding=1
+        )
+        self.mid_block = None
+        self.down_blocks = nn.ModuleList([])
+
+        from diffusers.models.unets.unet_1d_blocks import get_down_block
+
+        output_channel = block_out_channels[0]
+        for i, down_block_type in enumerate(down_block_types):
+            input_channel = output_channel
+            output_channel = block_out_channels[i]
+            is_final_block = i == len(block_out_channels) - 1
+            down_block = get_down_block(
+                down_block_type,
+                num_layers=self.layers_per_block,
+                in_channels=input_channel,
+                out_channels=output_channel,
+                add_downsample=not is_final_block,
+                temb_channels=None,
+            )
+            self.down_blocks.append(down_block)
+
+        self.mid_block = UNetMidBlock1D(
+            in_channels=block_out_channels[-1],
+            mid_channels=block_out_channels[-1],
+        )
+        self.conv_norm_out = nn.GroupNorm(
+            num_channels=block_out_channels[-1], num_groups=norm_num_groups, eps=1e-6
+        )
+        self.conv_act = nn.SiLU()
+        conv_out_channels = 2 * out_channels if double_z else out_channels
+        self.conv_out = nn.Conv1d(block_out_channels[-1], conv_out_channels, 3, padding=1)
+        self.gradient_checkpointing = False
+
+    def forward(self, x):
+        sample = self.conv_in(x)
+        for down_block in self.down_blocks:
+            sample = down_block(sample)[0]
+        sample = self.mid_block(sample)
+        sample = self.conv_norm_out(sample)
+        sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+        return sample
+
+
+class Decoder1D(nn.Module):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=3,
+        up_block_types=("UpDecoderBlock2D",),
+        block_out_channels=(64,),
+        layers_per_block=2,
+        norm_num_groups=32,
+        act_fn="silu",
+        norm_type="group",
+    ):
+        super().__init__()
+        self.layers_per_block = layers_per_block
+        self.conv_in = nn.Conv1d(
+            in_channels, block_out_channels[-1], kernel_size=3, stride=1, padding=1
+        )
+        self.mid_block = None
+        self.up_blocks = nn.ModuleList([])
+        self.mid_block = UNetMidBlock1D(
+            in_channels=block_out_channels[-1],
+            mid_channels=block_out_channels[-1],
+        )
+        reversed_block_out_channels = list(reversed(block_out_channels))
+        output_channel = reversed_block_out_channels[0]
+        for i, up_block_type in enumerate(up_block_types):
+            prev_output_channel = output_channel
+            output_channel = reversed_block_out_channels[i]
+            up_block = UpBlock1D(in_channels=prev_output_channel, out_channels=output_channel)
+            self.up_blocks.append(up_block)
+            prev_output_channel = output_channel
+        self.conv_norm_out = nn.GroupNorm(
+            num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6
+        )
+        self.conv_act = nn.SiLU()
+        self.conv_out = nn.Conv1d(block_out_channels[0], out_channels, 3, padding=1)
+        self.gradient_checkpointing = False
+
+    def forward(self, z, latent_embeds=None):
+        sample = self.conv_in(z)
+        sample = self.mid_block(sample, latent_embeds)
+        for up_block in self.up_blocks:
+            sample = up_block(sample, latent_embeds)
+        sample = self.conv_norm_out(sample)
+        sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+        return sample
+
+
+# ============================================================================
+# Fast encode/decode VAE halves (vendored from BrepGen/network.py)
+# ============================================================================
+
+
+class AutoencoderKL1DFastEncode(ModelMixin, ConfigMixin):
+    """Edge VAE encoder half (1D)."""
+
+    _supports_gradient_checkpointing = True
+
+    @register_to_config
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        down_block_types: Tuple[str] = ("DownEncoderBlock2D",),
+        up_block_types: Tuple[str] = ("UpDecoderBlock2D",),
+        block_out_channels: Tuple[int] = (64,),
+        layers_per_block: int = 1,
+        act_fn: str = "silu",
+        latent_channels: int = 4,
+        norm_num_groups: int = 32,
+        sample_size: int = 32,
+        scaling_factor: float = 0.18215,
+    ):
+        super().__init__()
+        self.encoder = Encoder1D(
+            in_channels=in_channels,
+            out_channels=latent_channels,
+            down_block_types=down_block_types,
+            block_out_channels=block_out_channels,
+            layers_per_block=layers_per_block,
+            act_fn=act_fn,
+            norm_num_groups=norm_num_groups,
+            double_z=True,
+        )
+        self.quant_conv = nn.Conv1d(2 * latent_channels, 2 * latent_channels, 1)
+
+    def forward(self, sample: torch.FloatTensor, sample_posterior: bool = False, generator=None):
+        h = self.encoder(sample)
+        moments = self.quant_conv(h)
+        return DiagonalGaussianDistribution(moments).mode()
+
+
+class AutoencoderKL1DFastDecode(ModelMixin, ConfigMixin):
+    """Edge VAE decoder half (1D)."""
+
+    _supports_gradient_checkpointing = True
+
+    @register_to_config
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        down_block_types: Tuple[str] = ("DownEncoderBlock2D",),
+        up_block_types: Tuple[str] = ("UpDecoderBlock2D",),
+        block_out_channels: Tuple[int] = (64,),
+        layers_per_block: int = 1,
+        act_fn: str = "silu",
+        latent_channels: int = 4,
+        norm_num_groups: int = 32,
+        sample_size: int = 32,
+        scaling_factor: float = 0.18215,
+    ):
+        super().__init__()
+        self.decoder = Decoder1D(
+            in_channels=latent_channels,
+            out_channels=out_channels,
+            up_block_types=up_block_types,
+            block_out_channels=block_out_channels,
+            layers_per_block=layers_per_block,
+            act_fn=act_fn,
+            norm_num_groups=norm_num_groups,
+        )
+        self.post_quant_conv = nn.Conv1d(latent_channels, latent_channels, 1)
+
+    def forward(self, z: torch.FloatTensor):
+        z = self.post_quant_conv(z)
+        return self.decoder(z)
+
+
+class AutoencoderKLFastEncode(ModelMixin, ConfigMixin):
+    """Surface VAE encoder half (2D)."""
+
+    _supports_gradient_checkpointing = True
+
+    @register_to_config
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        down_block_types: Tuple[str] = ("DownEncoderBlock2D",),
+        up_block_types: Tuple[str] = ("UpDecoderBlock2D",),
+        block_out_channels: Tuple[int] = (64,),
+        layers_per_block: int = 1,
+        act_fn: str = "silu",
+        latent_channels: int = 4,
+        norm_num_groups: int = 32,
+        sample_size: int = 32,
+        scaling_factor: float = 0.18215,
+        force_upcast: float = True,
+    ):
+        super().__init__()
+        self.encoder = Encoder(
+            in_channels=in_channels,
+            out_channels=latent_channels,
+            down_block_types=down_block_types,
+            block_out_channels=block_out_channels,
+            layers_per_block=layers_per_block,
+            act_fn=act_fn,
+            norm_num_groups=norm_num_groups,
+            double_z=True,
+        )
+        self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1)
+
+    def forward(self, x: torch.FloatTensor, return_dict: bool = True):
+        h = self.encoder(x)
+        moments = self.quant_conv(h)
+        return DiagonalGaussianDistribution(moments).mode()
+
+
+class AutoencoderKLFastDecode(ModelMixin, ConfigMixin):
+    """Surface VAE decoder half (2D)."""
+
+    _supports_gradient_checkpointing = True
+
+    @register_to_config
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        down_block_types: Tuple[str] = ("DownEncoderBlock2D",),
+        up_block_types: Tuple[str] = ("UpDecoderBlock2D",),
+        block_out_channels: Tuple[int] = (64,),
+        layers_per_block: int = 1,
+        act_fn: str = "silu",
+        latent_channels: int = 4,
+        norm_num_groups: int = 32,
+        sample_size: int = 32,
+        scaling_factor: float = 0.18215,
+        force_upcast: float = True,
+    ):
+        super().__init__()
+        self.decoder = Decoder(
+            in_channels=latent_channels,
+            out_channels=out_channels,
+            up_block_types=up_block_types,
+            block_out_channels=block_out_channels,
+            layers_per_block=layers_per_block,
+            norm_num_groups=norm_num_groups,
+            act_fn=act_fn,
+        )
+        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1)
+
+    def forward(self, z: torch.FloatTensor, return_dict: bool = True, generator=None):
+        z = self.post_quant_conv(z)
+        return self.decoder(z)
+
+
+# ============================================================================
+# GeomVAE wrapper
+# ============================================================================
+
+# Architecture configs matching the pretrained abc_vae_surf.pt / abc_vae_edge.pt
+_SURF_KW = dict(
+    in_channels=3,
+    out_channels=3,
+    down_block_types=[
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D",
+    ],
+    up_block_types=[
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D",
+    ],
+    block_out_channels=[128, 256, 512, 512],
+    layers_per_block=2,
+    act_fn="silu",
+    latent_channels=3,
+    norm_num_groups=32,
+    sample_size=512,
+)
+_EDGE_KW = dict(
+    in_channels=3,
+    out_channels=3,
+    down_block_types=["DownBlock1D", "DownBlock1D", "DownBlock1D"],
+    up_block_types=["UpBlock1D", "UpBlock1D", "UpBlock1D"],
+    block_out_channels=[128, 256, 512],
+    layers_per_block=2,
+    act_fn="silu",
+    latent_channels=3,
+    norm_num_groups=32,
+    sample_size=512,
+)
+
+SURF_LATENT_DIM = 48  # 3 channels x 4 x 4
+EDGE_LATENT_DIM = 12  # 3 channels x 4
+SURF_GRID_RES = 32
+EDGE_GRID_RES = 32
+
+
+def _load_vae_weights(path, encoder, decoder):
+    """A full VAE checkpoint contains both halves; require every parameter of each half."""
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if hasattr(state, "state_dict"):
+        state = state.state_dict()
+    for module in (encoder, decoder):
+        keys = module.state_dict().keys()
+        missing = set(keys) - state.keys()
+        if missing:
+            raise ValueError(f"Incomplete VAE checkpoint {path}: missing {sorted(missing)[:5]}")
+        module.load_state_dict({key: state[key] for key in keys}, strict=True)
+
+
+def _check_shape(value, trailing_shape, name):
+    if value.ndim != len(trailing_shape) + 1 or tuple(value.shape[1:]) != trailing_shape:
+        raise ValueError(
+            f"{name} expects [B, {', '.join(map(str, trailing_shape))}], got {tuple(value.shape)}"
+        )
+
+
+class GeomVAE(nn.Module):
+    """Frozen surface + edge VAE for UV-grid <-> latent conversion.
+
+    All methods operate in the per-primitive normalized frame ([-1, 1]).
+    Grids are channels-last on the public API; latents are flat.
+    """
+
+    def __init__(
+        self,
+        surf_ckpt: str,
+        edge_ckpt: str,
+        z_scale: float = 1.0,
+        device: Union[str, torch.device] = "cpu",
+    ):
+        super().__init__()
+        self.z_scale = float(z_scale)
+        if not math.isfinite(self.z_scale) or self.z_scale <= 0:
+            raise ValueError("VAE latent scale must be finite and positive")
+
+        self.surf_encoder = AutoencoderKLFastEncode(**_SURF_KW)
+        self.surf_decoder = AutoencoderKLFastDecode(**_SURF_KW)
+        self.edge_encoder = AutoencoderKL1DFastEncode(**_EDGE_KW)
+        self.edge_decoder = AutoencoderKL1DFastDecode(**_EDGE_KW)
+
+        _load_vae_weights(surf_ckpt, self.surf_encoder, self.surf_decoder)
+        _load_vae_weights(edge_ckpt, self.edge_encoder, self.edge_decoder)
+
+        self.eval()
+        self.requires_grad_(False)
+        self.to(device)
+
+    def train(self, mode=True):
+        return super().train(False)
+
+    # -- surface -------------------------------------------------------------
+    @torch.no_grad()
+    def encode_surf(self, grid: torch.Tensor) -> torch.Tensor:
+        """grid [B, 32, 32, 3] -> latent [B, 48]."""
+        _check_shape(grid, (32, 32, 3), "encode_surf")
+        if len(grid) == 0:
+            return grid.new_empty((0, SURF_LATENT_DIM), dtype=torch.float32)
+        with torch.autocast(device_type=grid.device.type, enabled=False):
+            x = grid.permute(0, 3, 1, 2).contiguous().float()  # [B,3,32,32]
+            z = self.surf_encoder(x)  # [B,3,4,4]
+            return (z.flatten(1) * self.z_scale).float()
+
+    @torch.no_grad()
+    def decode_surf(self, z: torch.Tensor) -> torch.Tensor:
+        """latent [B, 48] -> grid [B, 32, 32, 3]."""
+        _check_shape(z, (SURF_LATENT_DIM,), "decode_surf")
+        if len(z) == 0:
+            return z.new_empty((0, 32, 32, 3), dtype=torch.float32)
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            z = (z.float() / self.z_scale).view(-1, 3, 4, 4)
+            x = self.surf_decoder(z)  # [B,3,32,32]
+            return x.permute(0, 2, 3, 1).contiguous().float()
+
+    # -- edge ----------------------------------------------------------------
+    @torch.no_grad()
+    def encode_edge(self, grid: torch.Tensor) -> torch.Tensor:
+        """grid [B, 32, 3] -> latent [B, 12]."""
+        _check_shape(grid, (32, 3), "encode_edge")
+        if len(grid) == 0:
+            return grid.new_empty((0, EDGE_LATENT_DIM), dtype=torch.float32)
+        with torch.autocast(device_type=grid.device.type, enabled=False):
+            x = grid.permute(0, 2, 1).contiguous().float()  # [B,3,32]
+            z = self.edge_encoder(x)  # [B,3,4]
+            return (z.flatten(1) * self.z_scale).float()
+
+    @torch.no_grad()
+    def decode_edge(self, z: torch.Tensor) -> torch.Tensor:
+        """latent [B, 12] -> grid [B, 32, 3]."""
+        _check_shape(z, (EDGE_LATENT_DIM,), "decode_edge")
+        if len(z) == 0:
+            return z.new_empty((0, 32, 3), dtype=torch.float32)
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            z = (z.float() / self.z_scale).view(-1, 3, 4)
+            x = self.edge_decoder(z)  # [B,3,32]
+            return x.permute(0, 2, 1).contiguous().float()
+
+
+# ============================================================================
+# BrepGen upstream LICENSE (verbatim)
+# ============================================================================
+# The code, data and the model weights in this repository are not allowed for commercial usage. For research purposes, the terms follow the GPL v3, as in the separate file "LICENSE_GPL".
+# -- Authors of the paper "BrepGen: A B-rep Generative Diffusion Model with Structured Latent Geometry".
+
+
+# ============================================================================
+# BrepGen upstream LICENSE_GPL (verbatim)
+# ============================================================================
+#                     GNU GENERAL PUBLIC LICENSE
+#                        Version 3, 29 June 2007
+#
+#  Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+#  Everyone is permitted to copy and distribute verbatim copies
+#  of this license document, but changing it is not allowed.
+#
+#                             Preamble
+#
+#   The GNU General Public License is a free, copyleft license for
+# software and other kinds of works.
+#
+#   The licenses for most software and other practical works are designed
+# to take away your freedom to share and change the works.  By contrast,
+# the GNU General Public License is intended to guarantee your freedom to
+# share and change all versions of a program--to make sure it remains free
+# software for all its users.  We, the Free Software Foundation, use the
+# GNU General Public License for most of our software; it applies also to
+# any other work released this way by its authors.  You can apply it to
+# your programs, too.
+#
+#   When we speak of free software, we are referring to freedom, not
+# price.  Our General Public Licenses are designed to make sure that you
+# have the freedom to distribute copies of free software (and charge for
+# them if you wish), that you receive source code or can get it if you
+# want it, that you can change the software or use pieces of it in new
+# free programs, and that you know you can do these things.
+#
+#   To protect your rights, we need to prevent others from denying you
+# these rights or asking you to surrender the rights.  Therefore, you have
+# certain responsibilities if you distribute copies of the software, or if
+# you modify it: responsibilities to respect the freedom of others.
+#
+#   For example, if you distribute copies of such a program, whether
+# gratis or for a fee, you must pass on to the recipients the same
+# freedoms that you received.  You must make sure that they, too, receive
+# or can get the source code.  And you must show them these terms so they
+# know their rights.
+#
+#   Developers that use the GNU GPL protect your rights with two steps:
+# (1) assert copyright on the software, and (2) offer you this License
+# giving you legal permission to copy, distribute and/or modify it.
+#
+#   For the developers' and authors' protection, the GPL clearly explains
+# that there is no warranty for this free software.  For both users' and
+# authors' sake, the GPL requires that modified versions be marked as
+# changed, so that their problems will not be attributed erroneously to
+# authors of previous versions.
+#
+#   Some devices are designed to deny users access to install or run
+# modified versions of the software inside them, although the manufacturer
+# can do so.  This is fundamentally incompatible with the aim of
+# protecting users' freedom to change the software.  The systematic
+# pattern of such abuse occurs in the area of products for individuals to
+# use, which is precisely where it is most unacceptable.  Therefore, we
+# have designed this version of the GPL to prohibit the practice for those
+# products.  If such problems arise substantially in other domains, we
+# stand ready to extend this provision to those domains in future versions
+# of the GPL, as needed to protect the freedom of users.
+#
+#   Finally, every program is threatened constantly by software patents.
+# States should not allow patents to restrict development and use of
+# software on general-purpose computers, but in those that do, we wish to
+# avoid the special danger that patents applied to a free program could
+# make it effectively proprietary.  To prevent this, the GPL assures that
+# patents cannot be used to render the program non-free.
+#
+#   The precise terms and conditions for copying, distribution and
+# modification follow.
+#
+#                        TERMS AND CONDITIONS
+#
+#   0. Definitions.
+#
+#   "This License" refers to version 3 of the GNU General Public License.
+#
+#   "Copyright" also means copyright-like laws that apply to other kinds of
+# works, such as semiconductor masks.
+#
+#   "The Program" refers to any copyrightable work licensed under this
+# License.  Each licensee is addressed as "you".  "Licensees" and
+# "recipients" may be individuals or organizations.
+#
+#   To "modify" a work means to copy from or adapt all or part of the work
+# in a fashion requiring copyright permission, other than the making of an
+# exact copy.  The resulting work is called a "modified version" of the
+# earlier work or a work "based on" the earlier work.
+#
+#   A "covered work" means either the unmodified Program or a work based
+# on the Program.
+#
+#   To "propagate" a work means to do anything with it that, without
+# permission, would make you directly or secondarily liable for
+# infringement under applicable copyright law, except executing it on a
+# computer or modifying a private copy.  Propagation includes copying,
+# distribution (with or without modification), making available to the
+# public, and in some countries other activities as well.
+#
+#   To "convey" a work means any kind of propagation that enables other
+# parties to make or receive copies.  Mere interaction with a user through
+# a computer network, with no transfer of a copy, is not conveying.
+#
+#   An interactive user interface displays "Appropriate Legal Notices"
+# to the extent that it includes a convenient and prominently visible
+# feature that (1) displays an appropriate copyright notice, and (2)
+# tells the user that there is no warranty for the work (except to the
+# extent that warranties are provided), that licensees may convey the
+# work under this License, and how to view a copy of this License.  If
+# the interface presents a list of user commands or options, such as a
+# menu, a prominent item in the list meets this criterion.
+#
+#   1. Source Code.
+#
+#   The "source code" for a work means the preferred form of the work
+# for making modifications to it.  "Object code" means any non-source
+# form of a work.
+#
+#   A "Standard Interface" means an interface that either is an official
+# standard defined by a recognized standards body, or, in the case of
+# interfaces specified for a particular programming language, one that
+# is widely used among developers working in that language.
+#
+#   The "System Libraries" of an executable work include anything, other
+# than the work as a whole, that (a) is included in the normal form of
+# packaging a Major Component, but which is not part of that Major
+# Component, and (b) serves only to enable use of the work with that
+# Major Component, or to implement a Standard Interface for which an
+# implementation is available to the public in source code form.  A
+# "Major Component", in this context, means a major essential component
+# (kernel, window system, and so on) of the specific operating system
+# (if any) on which the executable work runs, or a compiler used to
+# produce the work, or an object code interpreter used to run it.
+#
+#   The "Corresponding Source" for a work in object code form means all
+# the source code needed to generate, install, and (for an executable
+# work) run the object code and to modify the work, including scripts to
+# control those activities.  However, it does not include the work's
+# System Libraries, or general-purpose tools or generally available free
+# programs which are used unmodified in performing those activities but
+# which are not part of the work.  For example, Corresponding Source
+# includes interface definition files associated with source files for
+# the work, and the source code for shared libraries and dynamically
+# linked subprograms that the work is specifically designed to require,
+# such as by intimate data communication or control flow between those
+# subprograms and other parts of the work.
+#
+#   The Corresponding Source need not include anything that users
+# can regenerate automatically from other parts of the Corresponding
+# Source.
+#
+#   The Corresponding Source for a work in source code form is that
+# same work.
+#
+#   2. Basic Permissions.
+#
+#   All rights granted under this License are granted for the term of
+# copyright on the Program, and are irrevocable provided the stated
+# conditions are met.  This License explicitly affirms your unlimited
+# permission to run the unmodified Program.  The output from running a
+# covered work is covered by this License only if the output, given its
+# content, constitutes a covered work.  This License acknowledges your
+# rights of fair use or other equivalent, as provided by copyright law.
+#
+#   You may make, run and propagate covered works that you do not
+# convey, without conditions so long as your license otherwise remains
+# in force.  You may convey covered works to others for the sole purpose
+# of having them make modifications exclusively for you, or provide you
+# with facilities for running those works, provided that you comply with
+# the terms of this License in conveying all material for which you do
+# not control copyright.  Those thus making or running the covered works
+# for you must do so exclusively on your behalf, under your direction
+# and control, on terms that prohibit them from making any copies of
+# your copyrighted material outside their relationship with you.
+#
+#   Conveying under any other circumstances is permitted solely under
+# the conditions stated below.  Sublicensing is not allowed; section 10
+# makes it unnecessary.
+#
+#   3. Protecting Users' Legal Rights From Anti-Circumvention Law.
+#
+#   No covered work shall be deemed part of an effective technological
+# measure under any applicable law fulfilling obligations under article
+# 11 of the WIPO copyright treaty adopted on 20 December 1996, or
+# similar laws prohibiting or restricting circumvention of such
+# measures.
+#
+#   When you convey a covered work, you waive any legal power to forbid
+# circumvention of technological measures to the extent such circumvention
+# is effected by exercising rights under this License with respect to
+# the covered work, and you disclaim any intention to limit operation or
+# modification of the work as a means of enforcing, against the work's
+# users, your or third parties' legal rights to forbid circumvention of
+# technological measures.
+#
+#   4. Conveying Verbatim Copies.
+#
+#   You may convey verbatim copies of the Program's source code as you
+# receive it, in any medium, provided that you conspicuously and
+# appropriately publish on each copy an appropriate copyright notice;
+# keep intact all notices stating that this License and any
+# non-permissive terms added in accord with section 7 apply to the code;
+# keep intact all notices of the absence of any warranty; and give all
+# recipients a copy of this License along with the Program.
+#
+#   You may charge any price or no price for each copy that you convey,
+# and you may offer support or warranty protection for a fee.
+#
+#   5. Conveying Modified Source Versions.
+#
+#   You may convey a work based on the Program, or the modifications to
+# produce it from the Program, in the form of source code under the
+# terms of section 4, provided that you also meet all of these conditions:
+#
+#     a) The work must carry prominent notices stating that you modified
+#     it, and giving a relevant date.
+#
+#     b) The work must carry prominent notices stating that it is
+#     released under this License and any conditions added under section
+#     7.  This requirement modifies the requirement in section 4 to
+#     "keep intact all notices".
+#
+#     c) You must license the entire work, as a whole, under this
+#     License to anyone who comes into possession of a copy.  This
+#     License will therefore apply, along with any applicable section 7
+#     additional terms, to the whole of the work, and all its parts,
+#     regardless of how they are packaged.  This License gives no
+#     permission to license the work in any other way, but it does not
+#     invalidate such permission if you have separately received it.
+#
+#     d) If the work has interactive user interfaces, each must display
+#     Appropriate Legal Notices; however, if the Program has interactive
+#     interfaces that do not display Appropriate Legal Notices, your
+#     work need not make them do so.
+#
+#   A compilation of a covered work with other separate and independent
+# works, which are not by their nature extensions of the covered work,
+# and which are not combined with it such as to form a larger program,
+# in or on a volume of a storage or distribution medium, is called an
+# "aggregate" if the compilation and its resulting copyright are not
+# used to limit the access or legal rights of the compilation's users
+# beyond what the individual works permit.  Inclusion of a covered work
+# in an aggregate does not cause this License to apply to the other
+# parts of the aggregate.
+#
+#   6. Conveying Non-Source Forms.
+#
+#   You may convey a covered work in object code form under the terms
+# of sections 4 and 5, provided that you also convey the
+# machine-readable Corresponding Source under the terms of this License,
+# in one of these ways:
+#
+#     a) Convey the object code in, or embodied in, a physical product
+#     (including a physical distribution medium), accompanied by the
+#     Corresponding Source fixed on a durable physical medium
+#     customarily used for software interchange.
+#
+#     b) Convey the object code in, or embodied in, a physical product
+#     (including a physical distribution medium), accompanied by a
+#     written offer, valid for at least three years and valid for as
+#     long as you offer spare parts or customer support for that product
+#     model, to give anyone who possesses the object code either (1) a
+#     copy of the Corresponding Source for all the software in the
+#     product that is covered by this License, on a durable physical
+#     medium customarily used for software interchange, for a price no
+#     more than your reasonable cost of physically performing this
+#     conveying of source, or (2) access to copy the
+#     Corresponding Source from a network server at no charge.
+#
+#     c) Convey individual copies of the object code with a copy of the
+#     written offer to provide the Corresponding Source.  This
+#     alternative is allowed only occasionally and noncommercially, and
+#     only if you received the object code with such an offer, in accord
+#     with subsection 6b.
+#
+#     d) Convey the object code by offering access from a designated
+#     place (gratis or for a charge), and offer equivalent access to the
+#     Corresponding Source in the same way through the same place at no
+#     further charge.  You need not require recipients to copy the
+#     Corresponding Source along with the object code.  If the place to
+#     copy the object code is a network server, the Corresponding Source
+#     may be on a different server (operated by you or a third party)
+#     that supports equivalent copying facilities, provided you maintain
+#     clear directions next to the object code saying where to find the
+#     Corresponding Source.  Regardless of what server hosts the
+#     Corresponding Source, you remain obligated to ensure that it is
+#     available for as long as needed to satisfy these requirements.
+#
+#     e) Convey the object code using peer-to-peer transmission, provided
+#     you inform other peers where the object code and Corresponding
+#     Source of the work are being offered to the general public at no
+#     charge under subsection 6d.
+#
+#   A separable portion of the object code, whose source code is excluded
+# from the Corresponding Source as a System Library, need not be
+# included in conveying the object code work.
+#
+#   A "User Product" is either (1) a "consumer product", which means any
+# tangible personal property which is normally used for personal, family,
+# or household purposes, or (2) anything designed or sold for incorporation
+# into a dwelling.  In determining whether a product is a consumer product,
+# doubtful cases shall be resolved in favor of coverage.  For a particular
+# product received by a particular user, "normally used" refers to a
+# typical or common use of that class of product, regardless of the status
+# of the particular user or of the way in which the particular user
+# actually uses, or expects or is expected to use, the product.  A product
+# is a consumer product regardless of whether the product has substantial
+# commercial, industrial or non-consumer uses, unless such uses represent
+# the only significant mode of use of the product.
+#
+#   "Installation Information" for a User Product means any methods,
+# procedures, authorization keys, or other information required to install
+# and execute modified versions of a covered work in that User Product from
+# a modified version of its Corresponding Source.  The information must
+# suffice to ensure that the continued functioning of the modified object
+# code is in no case prevented or interfered with solely because
+# modification has been made.
+#
+#   If you convey an object code work under this section in, or with, or
+# specifically for use in, a User Product, and the conveying occurs as
+# part of a transaction in which the right of possession and use of the
+# User Product is transferred to the recipient in perpetuity or for a
+# fixed term (regardless of how the transaction is characterized), the
+# Corresponding Source conveyed under this section must be accompanied
+# by the Installation Information.  But this requirement does not apply
+# if neither you nor any third party retains the ability to install
+# modified object code on the User Product (for example, the work has
+# been installed in ROM).
+#
+#   The requirement to provide Installation Information does not include a
+# requirement to continue to provide support service, warranty, or updates
+# for a work that has been modified or installed by the recipient, or for
+# the User Product in which it has been modified or installed.  Access to a
+# network may be denied when the modification itself materially and
+# adversely affects the operation of the network or violates the rules and
+# protocols for communication across the network.
+#
+#   Corresponding Source conveyed, and Installation Information provided,
+# in accord with this section must be in a format that is publicly
+# documented (and with an implementation available to the public in
+# source code form), and must require no special password or key for
+# unpacking, reading or copying.
+#
+#   7. Additional Terms.
+#
+#   "Additional permissions" are terms that supplement the terms of this
+# License by making exceptions from one or more of its conditions.
+# Additional permissions that are applicable to the entire Program shall
+# be treated as though they were included in this License, to the extent
+# that they are valid under applicable law.  If additional permissions
+# apply only to part of the Program, that part may be used separately
+# under those permissions, but the entire Program remains governed by
+# this License without regard to the additional permissions.
+#
+#   When you convey a copy of a covered work, you may at your option
+# remove any additional permissions from that copy, or from any part of
+# it.  (Additional permissions may be written to require their own
+# removal in certain cases when you modify the work.)  You may place
+# additional permissions on material, added by you to a covered work,
+# for which you have or can give appropriate copyright permission.
+#
+#   Notwithstanding any other provision of this License, for material you
+# add to a covered work, you may (if authorized by the copyright holders of
+# that material) supplement the terms of this License with terms:
+#
+#     a) Disclaiming warranty or limiting liability differently from the
+#     terms of sections 15 and 16 of this License; or
+#
+#     b) Requiring preservation of specified reasonable legal notices or
+#     author attributions in that material or in the Appropriate Legal
+#     Notices displayed by works containing it; or
+#
+#     c) Prohibiting misrepresentation of the origin of that material, or
+#     requiring that modified versions of such material be marked in
+#     reasonable ways as different from the original version; or
+#
+#     d) Limiting the use for publicity purposes of names of licensors or
+#     authors of the material; or
+#
+#     e) Declining to grant rights under trademark law for use of some
+#     trade names, trademarks, or service marks; or
+#
+#     f) Requiring indemnification of licensors and authors of that
+#     material by anyone who conveys the material (or modified versions of
+#     it) with contractual assumptions of liability to the recipient, for
+#     any liability that these contractual assumptions directly impose on
+#     those licensors and authors.
+#
+#   All other non-permissive additional terms are considered "further
+# restrictions" within the meaning of section 10.  If the Program as you
+# received it, or any part of it, contains a notice stating that it is
+# governed by this License along with a term that is a further
+# restriction, you may remove that term.  If a license document contains
+# a further restriction but permits relicensing or conveying under this
+# License, you may add to a covered work material governed by the terms
+# of that license document, provided that the further restriction does
+# not survive such relicensing or conveying.
+#
+#   If you add terms to a covered work in accord with this section, you
+# must place, in the relevant source files, a statement of the
+# additional terms that apply to those files, or a notice indicating
+# where to find the applicable terms.
+#
+#   Additional terms, permissive or non-permissive, may be stated in the
+# form of a separately written license, or stated as exceptions;
+# the above requirements apply either way.
+#
+#   8. Termination.
+#
+#   You may not propagate or modify a covered work except as expressly
+# provided under this License.  Any attempt otherwise to propagate or
+# modify it is void, and will automatically terminate your rights under
+# this License (including any patent licenses granted under the third
+# paragraph of section 11).
+#
+#   However, if you cease all violation of this License, then your
+# license from a particular copyright holder is reinstated (a)
+# provisionally, unless and until the copyright holder explicitly and
+# finally terminates your license, and (b) permanently, if the copyright
+# holder fails to notify you of the violation by some reasonable means
+# prior to 60 days after the cessation.
+#
+#   Moreover, your license from a particular copyright holder is
+# reinstated permanently if the copyright holder notifies you of the
+# violation by some reasonable means, this is the first time you have
+# received notice of violation of this License (for any work) from that
+# copyright holder, and you cure the violation prior to 30 days after
+# your receipt of the notice.
+#
+#   Termination of your rights under this section does not terminate the
+# licenses of parties who have received copies or rights from you under
+# this License.  If your rights have been terminated and not permanently
+# reinstated, you do not qualify to receive new licenses for the same
+# material under section 10.
+#
+#   9. Acceptance Not Required for Having Copies.
+#
+#   You are not required to accept this License in order to receive or
+# run a copy of the Program.  Ancillary propagation of a covered work
+# occurring solely as a consequence of using peer-to-peer transmission
+# to receive a copy likewise does not require acceptance.  However,
+# nothing other than this License grants you permission to propagate or
+# modify any covered work.  These actions infringe copyright if you do
+# not accept this License.  Therefore, by modifying or propagating a
+# covered work, you indicate your acceptance of this License to do so.
+#
+#   10. Automatic Licensing of Downstream Recipients.
+#
+#   Each time you convey a covered work, the recipient automatically
+# receives a license from the original licensors, to run, modify and
+# propagate that work, subject to this License.  You are not responsible
+# for enforcing compliance by third parties with this License.
+#
+#   An "entity transaction" is a transaction transferring control of an
+# organization, or substantially all assets of one, or subdividing an
+# organization, or merging organizations.  If propagation of a covered
+# work results from an entity transaction, each party to that
+# transaction who receives a copy of the work also receives whatever
+# licenses to the work the party's predecessor in interest had or could
+# give under the previous paragraph, plus a right to possession of the
+# Corresponding Source of the work from the predecessor in interest, if
+# the predecessor has it or can get it with reasonable efforts.
+#
+#   You may not impose any further restrictions on the exercise of the
+# rights granted or affirmed under this License.  For example, you may
+# not impose a license fee, royalty, or other charge for exercise of
+# rights granted under this License, and you may not initiate litigation
+# (including a cross-claim or counterclaim in a lawsuit) alleging that
+# any patent claim is infringed by making, using, selling, offering for
+# sale, or importing the Program or any portion of it.
+#
+#   11. Patents.
+#
+#   A "contributor" is a copyright holder who authorizes use under this
+# License of the Program or a work on which the Program is based.  The
+# work thus licensed is called the contributor's "contributor version".
+#
+#   A contributor's "essential patent claims" are all patent claims
+# owned or controlled by the contributor, whether already acquired or
+# hereafter acquired, that would be infringed by some manner, permitted
+# by this License, of making, using, or selling its contributor version,
+# but do not include claims that would be infringed only as a
+# consequence of further modification of the contributor version.  For
+# purposes of this definition, "control" includes the right to grant
+# patent sublicenses in a manner consistent with the requirements of
+# this License.
+#
+#   Each contributor grants you a non-exclusive, worldwide, royalty-free
+# patent license under the contributor's essential patent claims, to
+# make, use, sell, offer for sale, import and otherwise run, modify and
+# propagate the contents of its contributor version.
+#
+#   In the following three paragraphs, a "patent license" is any express
+# agreement or commitment, however denominated, not to enforce a patent
+# (such as an express permission to practice a patent or covenant not to
+# sue for patent infringement).  To "grant" such a patent license to a
+# party means to make such an agreement or commitment not to enforce a
+# patent against the party.
+#
+#   If you convey a covered work, knowingly relying on a patent license,
+# and the Corresponding Source of the work is not available for anyone
+# to copy, free of charge and under the terms of this License, through a
+# publicly available network server or other readily accessible means,
+# then you must either (1) cause the Corresponding Source to be so
+# available, or (2) arrange to deprive yourself of the benefit of the
+# patent license for this particular work, or (3) arrange, in a manner
+# consistent with the requirements of this License, to extend the patent
+# license to downstream recipients.  "Knowingly relying" means you have
+# actual knowledge that, but for the patent license, your conveying the
+# covered work in a country, or your recipient's use of the covered work
+# in a country, would infringe one or more identifiable patents in that
+# country that you have reason to believe are valid.
+#
+#   If, pursuant to or in connection with a single transaction or
+# arrangement, you convey, or propagate by procuring conveyance of, a
+# covered work, and grant a patent license to some of the parties
+# receiving the covered work authorizing them to use, propagate, modify
+# or convey a specific copy of the covered work, then the patent license
+# you grant is automatically extended to all recipients of the covered
+# work and works based on it.
+#
+#   A patent license is "discriminatory" if it does not include within
+# the scope of its coverage, prohibits the exercise of, or is
+# conditioned on the non-exercise of one or more of the rights that are
+# specifically granted under this License.  You may not convey a covered
+# work if you are a party to an arrangement with a third party that is
+# in the business of distributing software, under which you make payment
+# to the third party based on the extent of your activity of conveying
+# the work, and under which the third party grants, to any of the
+# parties who would receive the covered work from you, a discriminatory
+# patent license (a) in connection with copies of the covered work
+# conveyed by you (or copies made from those copies), or (b) primarily
+# for and in connection with specific products or compilations that
+# contain the covered work, unless you entered into that arrangement,
+# or that patent license was granted, prior to 28 March 2007.
+#
+#   Nothing in this License shall be construed as excluding or limiting
+# any implied license or other defenses to infringement that may
+# otherwise be available to you under applicable patent law.
+#
+#   12. No Surrender of Others' Freedom.
+#
+#   If conditions are imposed on you (whether by court order, agreement or
+# otherwise) that contradict the conditions of this License, they do not
+# excuse you from the conditions of this License.  If you cannot convey a
+# covered work so as to satisfy simultaneously your obligations under this
+# License and any other pertinent obligations, then as a consequence you may
+# not convey it at all.  For example, if you agree to terms that obligate you
+# to collect a royalty for further conveying from those to whom you convey
+# the Program, the only way you could satisfy both those terms and this
+# License would be to refrain entirely from conveying the Program.
+#
+#   13. Use with the GNU Affero General Public License.
+#
+#   Notwithstanding any other provision of this License, you have
+# permission to link or combine any covered work with a work licensed
+# under version 3 of the GNU Affero General Public License into a single
+# combined work, and to convey the resulting work.  The terms of this
+# License will continue to apply to the part which is the covered work,
+# but the special requirements of the GNU Affero General Public License,
+# section 13, concerning interaction through a network will apply to the
+# combination as such.
+#
+#   14. Revised Versions of this License.
+#
+#   The Free Software Foundation may publish revised and/or new versions of
+# the GNU General Public License from time to time.  Such new versions will
+# be similar in spirit to the present version, but may differ in detail to
+# address new problems or concerns.
+#
+#   Each version is given a distinguishing version number.  If the
+# Program specifies that a certain numbered version of the GNU General
+# Public License "or any later version" applies to it, you have the
+# option of following the terms and conditions either of that numbered
+# version or of any later version published by the Free Software
+# Foundation.  If the Program does not specify a version number of the
+# GNU General Public License, you may choose any version ever published
+# by the Free Software Foundation.
+#
+#   If the Program specifies that a proxy can decide which future
+# versions of the GNU General Public License can be used, that proxy's
+# public statement of acceptance of a version permanently authorizes you
+# to choose that version for the Program.
+#
+#   Later license versions may give you additional or different
+# permissions.  However, no additional obligations are imposed on any
+# author or copyright holder as a result of your choosing to follow a
+# later version.
+#
+#   15. Disclaimer of Warranty.
+#
+#   THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+# APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+# HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+# OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
+# IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
+# ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+#
+#   16. Limitation of Liability.
+#
+#   IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+# WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+# THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+# GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+# USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
+# DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
+# PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
+# EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGES.
+#
+#   17. Interpretation of Sections 15 and 16.
+#
+#   If the disclaimer of warranty and limitation of liability provided
+# above cannot be given local legal effect according to their terms,
+# reviewing courts shall apply local law that most closely approximates
+# an absolute waiver of all civil liability in connection with the
+# Program, unless a warranty or assumption of liability accompanies a
+# copy of the Program in return for a fee.
+#
+#                      END OF TERMS AND CONDITIONS
+#
+#             How to Apply These Terms to Your New Programs
+#
+#   If you develop a new program, and you want it to be of the greatest
+# possible use to the public, the best way to achieve this is to make it
+# free software which everyone can redistribute and change under these terms.
+#
+#   To do so, attach the following notices to the program.  It is safest
+# to attach them to the start of each source file to most effectively
+# state the exclusion of warranty; and each file should have at least
+# the "copyright" line and a pointer to where the full notice is found.
+#
+#     <one line to give the program's name and a brief idea of what it does.>
+#     Copyright (C) <year>  <name of author>
+#
+#     This program is free software: you can redistribute it and/or modify
+#     it under the terms of the GNU General Public License as published by
+#     the Free Software Foundation, either version 3 of the License, or
+#     (at your option) any later version.
+#
+#     This program is distributed in the hope that it will be useful,
+#     but WITHOUT ANY WARRANTY; without even the implied warranty of
+#     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#     GNU General Public License for more details.
+#
+#     You should have received a copy of the GNU General Public License
+#     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Also add information on how to contact you by electronic and paper mail.
+#
+#   If the program does terminal interaction, make it output a short
+# notice like this when it starts in an interactive mode:
+#
+#     <program>  Copyright (C) <year>  <name of author>
+#     This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.
+#     This is free software, and you are welcome to redistribute it
+#     under certain conditions; type `show c' for details.
+#
+# The hypothetical commands `show w' and `show c' should show the appropriate
+# parts of the General Public License.  Of course, your program's commands
+# might be different; for a GUI interface, you would use an "about box".
+#
+#   You should also get your employer (if you work as a programmer) or school,
+# if any, to sign a "copyright disclaimer" for the program, if necessary.
+# For more information on this, and how to apply and follow the GNU GPL, see
+# <https://www.gnu.org/licenses/>.
+#
+#   The GNU General Public License does not permit incorporating your program
+# into proprietary programs.  If your program is a subroutine library, you
+# may consider it more useful to permit linking proprietary applications with
+# the library.  If this is what you want to do, use the GNU Lesser General
+# Public License instead of this License.  But first, please read
+# <https://www.gnu.org/licenses/why-not-lgpl.html>.

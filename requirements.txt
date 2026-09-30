@@ -1,0 +1,21 @@
+# Source-level dependencies, not a reproduction lockfile.
+torch>=2.6
+numpy
+scipy
+PyYAML
+transformers>=5
+trimesh
+pebble
+tqdm
+Pillow
+matplotlib
+# Optional interactive HTML plotting:
+plotly
+# Conditional image/text generation and point-cloud encoder:
+torchvision
+timm
+# Optional UV-grid/VAE representation:
+diffusers
+# Optional logging:
+wandb
+# Install separately for your platform: pythonocc-core, pytorch3d, flash-attn.

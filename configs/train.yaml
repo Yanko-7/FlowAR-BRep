@@ -1,0 +1,78 @@
+# Editable reference settings; supply your own data.
+data:
+  path: data/npz
+  split_file: data/splits.json
+  max_num_tokens: 32768
+  augment: true
+  edge_id_range: 150
+  random_edgeid_start: true
+  random_rotation_prob: 0.0
+model:
+  hidden_size: 768
+  dropout: 0.2
+  num_attention_heads: 12
+  num_key_value_heads: 4
+  num_hidden_layers: 24
+  intermediate_size: 2048
+  rms_norm_eps: 1.0e-06
+  vocab_size: 2048
+  max_position_embeddings: 8192
+  surface_latent_dim: 64
+  curve_latent_dim: 16
+  geom_repr: bezier
+training:
+  output_dir: ./outputs
+  max_steps: 120000
+  resume_from_checkpoint: ''
+  resume_weights_only: false
+  resume_load_optimizer: true
+  resume_load_scheduler: true
+  resume_load_dataset: true
+  learning_rate: 0.0004
+  weight_decay: 0.1
+  gradient_clip: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-08
+  lr_scheduler: cosine
+  warmup_steps: 2000
+  min_lr: 1.0e-07
+  logging_steps: 10
+  save_steps: 1000
+  save_total_limit: 2
+  val_steps: 1000
+  max_val_batches: 50
+  use_amp: true
+  amp_dtype: bfloat16
+  gradient_accumulation_steps: 1
+diff_head:
+  depth: 6
+  adaln_depth: 2
+  model_dim: 768
+  time_shift: 1.0
+  P_mean: -0.8
+  P_std: 0.8
+  batch_mul: 1
+  surf_batch_mul: 1
+  curv_batch_mul: 1
+condition:
+  cond_type: null
+  cond_num_tokens: 257
+  cond_freeze_encoder: true
+  cond_pc_ckpt: ''
+  cond_clip_model: openai/clip-vit-large-patch14
+  cond_caption_json: ''
+  caption_dropout_prob: 0.1
+  cond_dino_model: ''
+  cond_image_dir: ''
+  cond_pc_points: 4096
+  cond_pc_extra_dir: ''
+wandb:
+  enabled: false
+  project: FlowAR-BRep
+  entity: null
+  run_name: null
+distributed:
+  backend: nccl
+  num_workers: 4
+  pin_memory: true

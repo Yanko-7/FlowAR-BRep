@@ -1,0 +1,5 @@
+base: train.yaml
+condition:
+  cond_type: pointcloud
+  cond_pc_ckpt: weights/uni3d.pt
+  cond_pc_extra_dir: data/pointclouds

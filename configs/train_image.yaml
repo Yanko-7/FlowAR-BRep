@@ -1,0 +1,5 @@
+base: train.yaml
+condition:
+  cond_type: dino_image
+  cond_dino_model: weights/dinov3
+  cond_image_dir: data/images

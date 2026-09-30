@@ -1,0 +1,4 @@
+base: train.yaml
+condition:
+  cond_type: clip_text
+  cond_caption_json: data/captions.json
