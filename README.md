@@ -1,21 +1,10 @@
-<div align="center">
-
 # FlowAR-BRep
 
-### Interleaved Autoregression and Flow Matching for Single-Stage B-Rep Generation
+**Interleaved Autoregression and Flow Matching for Single-Stage B-Rep Generation**
 
-**SIGGRAPH Asia 2026**
-
-Yongkang Qi<sup>1</sup> · Sunhong Qiu<sup>1</sup> · Hao Pan<sup>2</sup> · Haichuan Song<sup>1</sup>
-
-<sup>1</sup>East China Normal University &nbsp;&nbsp; <sup>2</sup>Tsinghua University
-
-[![Paper](https://img.shields.io/badge/Paper-ACM%20DL-0055A4)](https://doi.org/10.1145/3829340.3842332)
-[![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
+Yongkang Qi, Sunhong Qiu, Hao Pan, Haichuan Song · *[SIGGRAPH Asia 2026](https://doi.org/10.1145/3829340.3842332)*
 
 [![FlowAR-BRep teaser: a gallery of CAD boundary representations](assets/teaser.png)](assets/teaser.pdf)
-
-</div>
 
 FlowAR-BRep generates CAD boundary representations in a single stage. A transformer predicts topology autoregressively as discrete tokens, and each surface or curve is produced by flow matching as a continuous vector in the same sequence. This repository is the reference implementation, covering unconditional generation and generation conditioned on point clouds, images, or text.
 
